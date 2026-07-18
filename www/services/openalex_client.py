@@ -30,8 +30,71 @@ DEFAULT_PER_PAGE = 25
 MAX_PER_PAGE = 200  # limite massimo imposto dalle API OpenAlex
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_FACTOR = 1.5
-DEFAULT_TIMEOUT = 10  # secondi
+
+# Tupla (connect_timeout, read_timeout), non un singolo valore. DEBUGGING LOG:
+# con un timeout singolo (era 10s), `requests` lo applica come timeout di
+# INATTIVITA' tra un chunk di risposta e il successivo, NON come tetto sul
+# tempo totale della richiesta - se il server (o un proxy/CDN intermedio)
+# manda anche un solo byte ogni tanto entro la finestra, la richiesta puo'
+# restare appesa indefinitamente senza mai sollevare ReadTimeout. Diagnosticato
+# concretamente: una query "AI" e' rimasta bloccata >2m44s su una singola
+# chiamata di search_works (connessione TCP ESTABLISHED verso l'infrastruttura
+# OpenAlex, CPU 0%, nessun retry mai scattato) prima di essere interrotta
+# manualmente. connect_timeout=5s (tempo per stabilire la connessione TCP),
+# read_timeout=15s (silenzio massimo tollerato tra un byte e l'altro della
+# risposta) restano lo stesso tipo di garanzia "anti-inattivita'", ma con
+# margini piu' stretti; il vero argine contro un'attesa indefinita e' pero'
+# il tetto di tempo complessivo aggiunto a search_works (vedi piu' sotto) e a
+# get_works_by_ids, che non dipende da come si comporta il timeout di requests.
+DEFAULT_TIMEOUT = (5, 15)
+
 DEFAULT_BATCH_SIZE = 50  # limite OpenAlex per filter=openalex_id:ID1|ID2|...
+
+# max_retries ridotto, isolato a get_works_by_ids (risoluzione batch di
+# referenced_works per popolare CR). NON tocca DEFAULT_MAX_RETRIES, che resta
+# a 3 per search_works e per qualunque altro chiamante generico di
+# _request_with_retry. Motivazione: una query generica con molti risultati
+# puo' generare decine di batch da risolvere (es. 60 batch per 30 paper con
+# referenced_works al cap di 100 ciascuno); con max_retries=3 il caso peggiore
+# per singolo batch (assumendo che il read_timeout scatti regolarmente) resta
+# nell'ordine delle decine di secondi per tentativo, che su 60 batch si somma
+# rapidamente. Con max_retries=1 (2 tentativi totali) il caso peggiore per
+# singolo batch si dimezza, riducendo proporzionalmente anche il tetto
+# complessivo - in combinazione con il timeout di fase in
+# _resolve_references_for_works (vedi etl_pipeline.py), non con l'obiettivo
+# di eliminarlo da solo.
+RESOLVE_MAX_RETRIES = 1
+
+# Budget di default (secondi) per l'INTERA paginazione di search_works, non
+# per singola richiesta di pagina. Stesso ruolo di resolve_timeout_seconds in
+# get_works_by_ids/_resolve_references_for_works: un secondo argine oltre al
+# timeout a tupla di _request_with_retry, indipendente da come si comporta
+# la libreria requests in casi limite (connessione tenuta viva artificialmente,
+# server lento ma "vivo").
+DEFAULT_FETCH_TIMEOUT_SECONDS = 30
+
+# TERZO BUG REALE DIAGNOSTICATO OGGI (debugging log, stesso stile degli altri
+# due): _request_with_retry rispettava l'header Retry-After di una risposta
+# 429 senza alcun tetto massimo, facendo `time.sleep(float(retry_after))`.
+# Diagnosticato concretamente: dopo aver esaurito il budget giornaliero delle
+# API OpenAlex durante i test di questa sessione, una richiesta ha ricevuto
+# 429 con `Retry-After: 28979` (quasi 8 ore) e il processo e' rimasto
+# "bloccato" per ore in un time.sleep() legittimo ma inutilizzabile in un
+# contesto interattivo (Shiny). La firma era identica a un socket appeso
+# (CPU 0%, stato sleeping, connessione TCP ESTABLISHED del pool keep-alive di
+# requests ancora aperta) e per questo era stata scambiata inizialmente per
+# un problema di timeout HTTP - non lo era: la risposta 429 arrivava in
+# meno di 0.1s, il problema era tutto nello sleep successivo, non tollerato
+# ne' dal timeout a tupla di _request_with_retry (si applica solo mentre si
+# attende la risposta, non dopo averla ricevuta) ne' dal budget di fase di
+# search_works/get_works_by_ids (controllato solo PRIMA di iniziare una nuova
+# richiesta, non durante lo sleep interno a un tentativo gia' in corso).
+# Nessun retry_after piu' lungo di questo tetto viene piu' onorato per intero:
+# se la richiesta fallisce ancora dopo l'attesa limitata e i tentativi
+# rimasti, risale normalmente come OpenAlexRequestError (comportamento gia'
+# esistente, invariato), che il resto della pipeline e l'handler della pagina
+# API sanno gia' gestire mostrando un errore invece di bloccarsi in silenzio.
+MAX_RETRY_AFTER_WAIT_SECONDS = 20
 
 
 class OpenAlexRequestError(Exception):
@@ -40,7 +103,8 @@ class OpenAlexRequestError(Exception):
     pass
 
 
-def search_works(query, max_results=None, filters=None, mailto=None, per_page=MAX_PER_PAGE):
+def search_works(query, max_results=None, filters=None, mailto=None, per_page=MAX_PER_PAGE,
+                  fetch_timeout_seconds=DEFAULT_FETCH_TIMEOUT_SECONDS, start_time=None):
     """
     Esegue una ricerca testuale completa su /works, paginando automaticamente
     con cursore finche' OpenAlex non restituisce `meta.next_cursor == None`
@@ -48,6 +112,19 @@ def search_works(query, max_results=None, filters=None, mailto=None, per_page=MA
 
     Ogni singola richiesta di pagina passa da _request_with_retry (retry con
     backoff esponenziale su 429/5xx/errori di rete, vedi quella funzione).
+
+    LIMITE DI SICUREZZA (debugging log): se `fetch_timeout_seconds` non e'
+    None, PRIMA di richiedere ogni nuova pagina si controlla il tempo
+    trascorso da `start_time` (o dall'inizio di questa chiamata, se
+    start_time non e' fornito): se il budget e' superato, la paginazione si
+    interrompe con un break (non un'eccezione) e vengono restituiti i
+    risultati gia' raccolti fino a quel momento (parziali ma utilizzabili),
+    invece di continuare a chiedere altre pagine indefinitamente. E' un
+    secondo argine indipendente dal timeout a tupla di _request_with_retry:
+    diagnosticato un caso reale in cui una singola richiesta HTTP e' rimasta
+    bloccata piu' di due minuti senza mai sollevare un'eccezione di timeout
+    (connessione tenuta viva artificialmente) - questo budget limita il danno
+    anche se il timeout della singola richiesta non dovesse bastare.
 
     Args:
         query: stringa di ricerca libera, mappata sul parametro `search` di OpenAlex.
@@ -66,10 +143,20 @@ def search_works(query, max_results=None, filters=None, mailto=None, per_page=MA
             il numero di richieste). Esposto come parametro soprattutto per
             poterlo abbassare nei test, cosi' da forzare piu' pagine anche con
             max_results piccoli.
+        fetch_timeout_seconds: budget di tempo (secondi) per l'INTERA
+            paginazione, non per singola richiesta. Default
+            DEFAULT_FETCH_TIMEOUT_SECONDS (30s). None per nessun limite
+            (comportamento pre-esistente).
+        start_time: istante di riferimento (da time.monotonic()) da cui
+            calcolare il tempo trascorso; se None, si usa l'istante di
+            ingresso in questa funzione. Permette al chiamante (tipicamente
+            etl_pipeline.py::_fetch_raw_works) di far partire il cronometro
+            prima ancora di chiamare search_works.
 
     Returns:
-        list[dict]: work grezzi raccolti su tutte le pagine necessarie,
-        nell'ordine restituito da OpenAlex, troncati a max_results se specificato.
+        list[dict]: work grezzi raccolti su tutte le pagine necessarie (o
+        raccolte prima dell'esaurimento del budget di tempo), nell'ordine
+        restituito da OpenAlex, troncati a max_results se specificato.
 
     Raises:
         OpenAlexRequestError: se una richiesta di pagina fallisce in modo non
@@ -78,12 +165,22 @@ def search_works(query, max_results=None, filters=None, mailto=None, per_page=MA
     if max_results is not None and max_results <= 0:
         return []
 
+    if start_time is None:
+        start_time = time.monotonic()
+
     effective_per_page = min(per_page, MAX_PER_PAGE)
 
     results = []
     cursor = "*"
 
     while cursor is not None:
+        if fetch_timeout_seconds is not None and (time.monotonic() - start_time) > fetch_timeout_seconds:
+            logger.warning(
+                "search_works: budget di %.1fs esaurito, interrotta la paginazione dopo %d risultati raccolti",
+                fetch_timeout_seconds, len(results),
+            )
+            break
+
         params = {
             "search": query,
             "per-page": effective_per_page,
@@ -147,7 +244,7 @@ def get_work_by_id(openalex_id, mailto=None):
     raise NotImplementedError
 
 
-def get_works_by_ids(ids, mailto=None, batch_size=DEFAULT_BATCH_SIZE):
+def get_works_by_ids(ids, mailto=None, batch_size=DEFAULT_BATCH_SIZE, resolve_timeout_seconds=None, start_time=None):
     """
     Risolve in batch una lista di ID OpenAlex verso i rispettivi oggetti "work"
     completi, usando il filtro OR `openalex_id:ID1|ID2|...` supportato da /works
@@ -166,6 +263,22 @@ def get_works_by_ids(ids, mailto=None, batch_size=DEFAULT_BATCH_SIZE):
     solo il dizionario risultato: se questa distinzione servisse a valle, andra'
     aggiunta separatamente (es. restituendo anche la lista di ID falliti).
 
+    Ogni chiamata HTTP verso un batch usa RESOLVE_MAX_RETRIES (1 ri-tentativo,
+    non i 3 di default) invece del default di _request_with_retry: qui i batch
+    possono essere decine per una singola risoluzione (vedi
+    etl_pipeline.py::_resolve_references_for_works), quindi il costo peggiore
+    per singolo batch va tenuto basso deliberatamente, a differenza di
+    search_works che chiama _request_with_retry con i retry di default.
+
+    Se resolve_timeout_seconds e' specificato, PRIMA di iniziare ogni nuovo
+    batch si controlla il tempo trascorso da start_time (o dall'inizio di
+    questa chiamata, se start_time non e' fornito): se il budget e' superato,
+    il loop si interrompe con un break (non un'eccezione) e viene restituito
+    il dizionario parziale gia' risolto fino a quel momento. Gli ID dei batch
+    non ancora processati restano semplicemente assenti dal risultato, con lo
+    stesso effetto pratico di un batch fallito: format_cr_column ricadra' sul
+    fallback a ID nudo per quei riferimenti.
+
     Args:
         ids: lista di ID OpenAlex (forma short "W123..." o URL completo
             "https://openalex.org/W123...") da risolvere. Duplicati e ID
@@ -173,12 +286,22 @@ def get_works_by_ids(ids, mailto=None, batch_size=DEFAULT_BATCH_SIZE):
         mailto: email per la polite pool.
         batch_size: numero massimo di ID per chiamata; la lista (deduplicata e
             normalizzata) viene spezzata in chunk di questa dimensione.
+        resolve_timeout_seconds: budget di tempo (secondi) per l'INTERA
+            risoluzione, non per singolo batch. None (default) significa
+            nessun limite: tutti i batch vengono processati indipendentemente
+            dal tempo impiegato.
+        start_time: istante di riferimento (da time.monotonic()) da cui
+            calcolare il tempo trascorso; se None, si usa l'istante di ingresso
+            in questa funzione. Permette al chiamante (tipicamente
+            etl_pipeline.py::_resolve_references_for_works) di far partire il
+            cronometro prima ancora di chiamare get_works_by_ids.
 
     Returns:
         dict[str, dict]: mappa da ID OpenAlex normalizzato (short form) al
         relativo oggetto "work" grezzo. Gli ID non risolvibili (non trovati da
-        OpenAlex, oppure appartenenti a un batch fallito dopo i retry) sono
-        semplicemente assenti dal risultato.
+        OpenAlex, appartenenti a un batch fallito dopo i retry, oppure mai
+        raggiunti per esaurimento del budget di tempo) sono semplicemente
+        assenti dal risultato.
     """
     normalized_ids = []
     seen = set()
@@ -188,8 +311,20 @@ def get_works_by_ids(ids, mailto=None, batch_size=DEFAULT_BATCH_SIZE):
             seen.add(normalized)
             normalized_ids.append(normalized)
 
+    if start_time is None:
+        start_time = time.monotonic()
+
     resolved = {}
     for batch_start in range(0, len(normalized_ids), batch_size):
+        if resolve_timeout_seconds is not None and (time.monotonic() - start_time) > resolve_timeout_seconds:
+            logger.warning(
+                "get_works_by_ids: budget di %.1fs esaurito, interrotto dopo %d/%d ID risolti "
+                "(%d batch rimanenti non processati)",
+                resolve_timeout_seconds, len(resolved), len(normalized_ids),
+                (len(normalized_ids) - batch_start + batch_size - 1) // batch_size,
+            )
+            break
+
         batch = normalized_ids[batch_start:batch_start + batch_size]
         params = {
             "filter": "openalex_id:" + "|".join(batch),
@@ -201,7 +336,7 @@ def get_works_by_ids(ids, mailto=None, batch_size=DEFAULT_BATCH_SIZE):
             params["mailto"] = mailto
 
         try:
-            response = _request_with_retry(WORKS_ENDPOINT, params)
+            response = _request_with_retry(WORKS_ENDPOINT, params, max_retries=RESOLVE_MAX_RETRIES)
         except OpenAlexRequestError as exc:
             logger.error(
                 "get_works_by_ids: batch di %d ID fallito dopo i retry (primi ID: %s): %s",
@@ -242,8 +377,10 @@ def _request_with_retry(url, params, max_retries=DEFAULT_MAX_RETRIES, backoff_fa
 
     Riprova la richiesta in caso di:
     - errori di rete/timeout,
-    - HTTP 429 (rate limit), rispettando l'header Retry-After se presente
-      (altrimenti backoff esponenziale),
+    - HTTP 429 (rate limit), rispettando l'header Retry-After se presente ma
+      con un tetto a MAX_RETRY_AFTER_WAIT_SECONDS (un server puo' chiedere
+      un'attesa di ore, vedi il commento su quella costante; altrimenti
+      backoff esponenziale),
     - HTTP 5xx (errori transitori lato server).
 
     Non riprova su errori 4xx diversi da 429 (es. 400/404), che vengono considerati
@@ -256,7 +393,11 @@ def _request_with_retry(url, params, max_retries=DEFAULT_MAX_RETRIES, backoff_fa
             massimo max_retries + 1 richieste HTTP totali).
         backoff_factor: fattore moltiplicativo per il tempo di attesa tra un
             tentativo e il successivo (attesa = backoff_factor ** tentativo).
-        timeout: timeout in secondi per ciascuna richiesta HTTP.
+        timeout: tupla (connect_timeout, read_timeout) in secondi, passata
+            direttamente a requests.get. NON e' un tetto sul tempo totale
+            della richiesta: read_timeout e' il silenzio massimo tollerato
+            tra un chunk di risposta e il successivo (vedi DEFAULT_TIMEOUT
+            per il perche' di questa distinzione).
 
     Returns:
         requests.Response: la risposta HTTP con status < 400.
@@ -294,7 +435,13 @@ def _request_with_retry(url, params, max_retries=DEFAULT_MAX_RETRIES, backoff_fa
             wait_seconds = backoff_factor ** attempt
             if retry_after is not None:
                 try:
-                    wait_seconds = float(retry_after)
+                    # Tetto a MAX_RETRY_AFTER_WAIT_SECONDS: un server puo'
+                    # legittimamente chiedere di attendere ore (visto in
+                    # produzione con un 429 da budget esaurito e
+                    # Retry-After: 28979), ma un'attesa cosi' lunga non e'
+                    # utilizzabile in un contesto interattivo - vedi il
+                    # commento su MAX_RETRY_AFTER_WAIT_SECONDS per il dettaglio.
+                    wait_seconds = min(float(retry_after), MAX_RETRY_AFTER_WAIT_SECONDS)
                 except ValueError:
                     pass
             time.sleep(wait_seconds)

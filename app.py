@@ -8284,7 +8284,7 @@ with ui.tags.div(id="mainContent", class_="main-content"):
 
 # --- Sidebar Management ---
 @render.express()
-@reactive.event(input.start_button)
+@reactive.event(input.start_button, input.start_api_button)
 def toggle_sidebar():
     with ui.tags.div(id="sidebar_2", class_="custom-sidebar"):
         with ui.accordion(id="sidebar_accordion_data", multiple=False, open=False):

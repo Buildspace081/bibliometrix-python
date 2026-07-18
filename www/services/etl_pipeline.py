@@ -27,6 +27,13 @@ from .openalex_mapper import *
 from .type_contracts import *
 
 
+# Budget di default (secondi) per l'intera fase di risoluzione batch dei
+# referenced_works (vedi _resolve_references_for_works). Esposto anche come
+# parametro pubblico di run_openalex_etl, cosi' e' configurabile senza
+# toccare il codice interno.
+DEFAULT_RESOLVE_TIMEOUT_SECONDS = 30
+
+
 class ETLPipelineError(Exception):
     """Sollevata quando la pipeline ETL fallisce in uno dei suoi stadi (fetch,
     risoluzione referenze, mapping, validazione) in un modo che non permette di
@@ -41,6 +48,8 @@ def run_openalex_etl(
     max_results=None,
     resolve_references=True,
     strict_validation=True,
+    resolve_timeout_seconds=DEFAULT_RESOLVE_TIMEOUT_SECONDS,
+    fetch_timeout_seconds=DEFAULT_FETCH_TIMEOUT_SECONDS,
 ):
     """
     Entry-point principale: esegue l'intera pipeline ETL da una query utente
@@ -58,6 +67,25 @@ def run_openalex_etl(
             per popolare la colonna CR con citazioni leggibili invece dei soli ID
             OpenAlex (costo aggiuntivo in chiamate HTTP, vedi
             openalex_client.get_works_by_ids).
+        fetch_timeout_seconds: budget di tempo (secondi) per l'INTERA
+            paginazione della ricerca iniziale (non per singola richiesta HTTP),
+            passato a openalex_client.search_works tramite _fetch_raw_works.
+            Default DEFAULT_FETCH_TIMEOUT_SECONDS (30s): oltre questo tetto, le
+            pagine non ancora richieste vengono saltate (nessuna eccezione) e
+            si procede con i work gia' raccolti fino a quel momento. None per
+            nessun limite (comportamento pre-esistente, sconsigliato: e' la
+            fase in cui e' stato diagnosticato un blocco reale di oltre due
+            minuti senza mai un'eccezione).
+        resolve_timeout_seconds: budget di tempo (secondi) per l'INTERA fase di
+            risoluzione dei riferimenti (non per singola chiamata HTTP), passato
+            a _resolve_references_for_works. Default DEFAULT_RESOLVE_TIMEOUT_SECONDS
+            (30s): oltre questo tetto, i batch non ancora processati vengono
+            saltati (nessuna eccezione) e i riferimenti corrispondenti ricadono
+            sul fallback a ID nudo in format_cr_column, invece di bloccare
+            l'intera pipeline su query con molte referenze da risolvere.
+            None per nessun limite (comportamento pre-esistente, sconsigliato
+            su query generiche/con molti risultati). Ignorato se
+            resolve_references=False.
         strict_validation: passato come `strict` a type_contracts.validate_record
             per ogni record dopo la coercizione dei tipi: se True (default),
             eventuali colonne non riconosciute nello schema canonico contano come
@@ -85,11 +113,13 @@ def run_openalex_etl(
             (nessun risultato dalla query, errore HTTP non gestito dal client,
             oppure errori di validazione residui dopo la coercizione dei tipi).
     """
-    works = _fetch_raw_works(query, filters, mailto, max_results)
+    works = _fetch_raw_works(query, filters, mailto, max_results, fetch_timeout_seconds=fetch_timeout_seconds)
 
     resolved_references = None
     if resolve_references:
-        resolved_references = _resolve_references_for_works(works, mailto)
+        resolved_references = _resolve_references_for_works(
+            works, mailto, resolve_timeout_seconds=resolve_timeout_seconds
+        )
 
     records = _map_works_to_records(works, resolved_references=resolved_references)
     records = _compute_calculated_fields(records)
@@ -101,18 +131,31 @@ def run_openalex_etl(
     return df, []
 
 
-def _fetch_raw_works(query, filters, mailto, max_results):
+def _fetch_raw_works(query, filters, mailto, max_results, fetch_timeout_seconds=DEFAULT_FETCH_TIMEOUT_SECONDS):
     """
     Stadio 1: recupera dalla API OpenAlex la lista grezza di oggetti "work" (dict
     JSON) corrispondenti alla query utente, delegando a
     openalex_client.search_works (che gia' pagina internamente con cursore fino
     a max_results o esaurimento dei risultati).
 
+    LIMITE DI SICUREZZA (debugging log): search_works riceve qui il budget di
+    tempo `fetch_timeout_seconds` (vedi il suo docstring per il dettaglio del
+    caso reale diagnosticato: una singola richiesta rimasta bloccata >2m44s
+    senza mai sollevare un'eccezione di timeout). Se il budget scade a meta'
+    paginazione, search_works restituisce i risultati raccolti fino a quel
+    momento invece di bloccare - _fetch_raw_works non tratta questo come un
+    errore: una lista parziale ma non vuota e' comunque un risultato valido
+    per il resto della pipeline.
+
     Args:
         query, filters, mailto, max_results: vedi run_openalex_etl.
+        fetch_timeout_seconds: budget di tempo (secondi) per l'INTERA
+            paginazione di search_works. Default DEFAULT_FETCH_TIMEOUT_SECONDS
+            (30s, definito in openalex_client.py). None per nessun limite.
 
     Returns:
-        list[dict]: oggetti "work" OpenAlex grezzi.
+        list[dict]: oggetti "work" OpenAlex grezzi (eventualmente parziali se
+        il budget di tempo e' stato superato durante la paginazione).
 
     Raises:
         ETLPipelineError: se la query non produce alcun risultato, oppure se
@@ -120,7 +163,13 @@ def _fetch_raw_works(query, filters, mailto, max_results):
             HTTP non recuperabile dopo i retry).
     """
     try:
-        works = search_works(query, max_results=max_results, filters=filters, mailto=mailto)
+        works = search_works(
+            query,
+            max_results=max_results,
+            filters=filters,
+            mailto=mailto,
+            fetch_timeout_seconds=fetch_timeout_seconds,
+        )
     except OpenAlexRequestError as exc:
         raise ETLPipelineError(
             f"Recupero dei work da OpenAlex fallito per la query {query!r}: {exc}"
@@ -132,7 +181,7 @@ def _fetch_raw_works(query, filters, mailto, max_results):
     return works
 
 
-def _resolve_references_for_works(works, mailto):
+def _resolve_references_for_works(works, mailto, resolve_timeout_seconds=DEFAULT_RESOLVE_TIMEOUT_SECONDS):
     """
     Stadio 2 (opzionale): raccoglie l'unione di tutti gli ID presenti nel campo
     `referenced_works` dei work scaricati e li risolve in batch tramite
@@ -151,15 +200,34 @@ def _resolve_references_for_works(works, mailto):
     stessi ID che format_cr_column considerera' comunque (lo stesso cap), quindi
     risolvere ID oltre quel limite sarebbe lavoro sprecato.
 
+    LIMITE DI SICUREZZA (debugging log): una query generica con molti risultati
+    puo' generare migliaia di ID da risolvere (es. 30 work x MAX_REFERENCED_WORKS=100
+    = fino a 3000 ID, cioe' 60 batch da 50). Senza un tetto, nel caso peggiore di
+    errori di rete ripetuti su ogni batch, il tempo totale poteva arrivare a
+    decine di minuti (~45 min con i retry di default), bloccando l'intero
+    handler Shiny sincrono che chiama run_openalex_etl. Il cronometro parte QUI,
+    all'inizio di questa funzione (time.monotonic()), e viene passato a
+    get_works_by_ids, che lo controlla prima di iniziare ogni nuovo batch: se il
+    budget e' superato, i batch rimanenti vengono saltati (nessuna eccezione) e
+    si restituisce il dizionario parziale gia' risolto. I riferimenti non
+    risolti in tempo ricadono sul fallback a ID nudo gia' esistente in
+    openalex_mapper.py::format_cr_column - degradazione, non blocco.
+
     Args:
         works: list[dict] di work OpenAlex grezzi, vedi _fetch_raw_works.
         mailto: email per la polite pool.
+        resolve_timeout_seconds: budget di tempo (secondi) per l'INTERA
+            risoluzione (non per singolo batch). Default
+            DEFAULT_RESOLVE_TIMEOUT_SECONDS (30s). None per nessun limite.
 
     Returns:
         dict[str, dict]: mappa da ID OpenAlex a oggetto "work" risolto, passata a
         openalex_mapper.map_work_to_record / format_cr_column. Dizionario vuoto
-        se nessun work ha referenced_works.
+        se nessun work ha referenced_works. Puo' essere parziale se il budget di
+        tempo e' stato superato prima di processare tutti i batch.
     """
+    start_time = time.monotonic()
+
     seen = set()
     all_ids = []
     for work in works:
@@ -172,7 +240,12 @@ def _resolve_references_for_works(works, mailto):
     if not all_ids:
         return {}
 
-    return get_works_by_ids(all_ids, mailto=mailto)
+    return get_works_by_ids(
+        all_ids,
+        mailto=mailto,
+        resolve_timeout_seconds=resolve_timeout_seconds,
+        start_time=start_time,
+    )
 
 
 def _map_works_to_records(works, resolved_references=None):
