@@ -854,8 +854,107 @@ with ui.tags.div(id="mainContent", class_="main-content"):
                 ),
 
         with ui.nav_panel("None", value="API"):
-            ui.h3("🚧 Warning: API is under construction 🚧")
-        
+            ui.h3("🔌 OpenAlex API", style="color: #5567BB;")
+            ui.p("Search OpenAlex directly and import the results as a bibliometrix-style dataset.")
+
+            with ui.layout_sidebar(fillable=False, fill=False):
+                with ui.sidebar(id="sidebar_api", position="right"):
+                    ui.h5("OpenAlex Query", style="color: #5567BB;")
+                    ui.input_text("api_query", "Search query", placeholder="es. machine learning")
+                    ui.input_numeric("api_max_results", "Max results", value=50, min=1, max=200)
+                    ui.input_action_button("start_api_button", "Start", icon=ICONS["play"])
+
+                @reactive.effect
+                @reactive.event(input.start_api_button)
+                def run_api_query():
+                    # Show loading modal while querying (same style as Historiograph)
+                    def loading_modal():
+                        phrases = [
+                            "⏳ Loading... Please wait.",
+                            "🔎 Querying OpenAlex...",
+                            "📥 Downloading records...",
+                            "🧬 Standardizing metadata...",
+                            "📊 Preparing your dataset...",
+                            "✨ Almost there! Preparing your dashboard...",
+                        ]
+                        modal = ui.modal(
+                            ui.div(
+                                ui.img(
+                                    src="https://cisslaboral.laleynext.es/Img/loader-circle.gif",
+                                    height="150px",
+                                    style="display: block; margin: 0 auto; text-align: center;",
+                                ),
+                                ui.h4(
+                                    phrases[0],
+                                    id="loading-phrase",
+                                    style="font-size: 15px; text-align: center; margin-top: 20px; color: gray;",
+                                ),
+                            ),
+                            easy_close=False,
+                            footer=None,
+                        )
+                        js = f"""
+                        <script>
+                        (function() {{
+                            var phrases = {phrases};
+                            var idx = 0;
+                            var el = document.getElementById('loading-phrase');
+                            if (el) {{
+                                setInterval(function() {{
+                                    idx = (idx + 1) % phrases.length;
+                                    el.textContent = phrases[idx];
+                                }}, 1000);
+                            }}
+                        }})();
+                        </script>
+                        """
+                        return ui.HTML(str(modal) + js)
+
+                    ui.modal_show(loading_modal())
+                    try:
+                        query = (input.api_query() or "").strip()
+                        max_results = int(input.api_max_results())
+
+                        if not query:
+                            ui.notification_show("⚠️ Please enter a search query.", type="warning", duration=5)
+                            return
+
+                        # info@bibliometrix.org: indirizzo di progetto gia' usato
+                        # altrove in app.py (sezione About) per la polite pool OpenAlex
+                        result_df, validation_errors = run_openalex_etl(
+                            query,
+                            mailto="info@bibliometrix.org",
+                            max_results=max_results,
+                        )
+
+                        df.set(result_df)
+                        reset_all_analyses()
+                        ui.notification_show(
+                            f"✅ OpenAlex query completed! The dataset contains {result_df.shape[0]} rows and {result_df.shape[1]} columns.",
+                            duration=5,
+                            close_button=False,
+                        )
+                    except (ETLPipelineError, OpenAlexRequestError) as e:
+                        ui.notification_show(f"❌ Error querying OpenAlex: {str(e)}", type="error", duration=10)
+                    except Exception as e:
+                        ui.notification_show(f"❌ Unexpected error: {str(e)}", type="error", duration=10)
+                    finally:
+                        ui.modal_remove()
+
+                @render.ui
+                @reactive.event(input.start_api_button)
+                def show_api_table():
+                    if df.get() is None:
+                        return ui.div(
+                            ui.p(
+                                "No dataset loaded yet. Enter a query and click Start.",
+                                style="text-align: center; color: #666; font-size: 16px;"
+                            ),
+                            style="display: flex; flex-direction: column; justify-content: center; align-items: center; height: 150px; border: 2px dashed #ddd; border-radius: 10px; margin: 20px;"
+                        )
+                    table_ui, _, _ = get_table("OpenAlex", df)
+                    return table_ui
+
         with ui.nav_panel("None", value="collections"):
             ui.h3("🚧 Warning: Merge Collection is under construction 🚧")
 
