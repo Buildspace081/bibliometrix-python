@@ -2,4 +2,4 @@ __pycache__/
 bibliovenv/
 Bibenv/
 .venv/
-.idea/
+.idea/.DS_Store
