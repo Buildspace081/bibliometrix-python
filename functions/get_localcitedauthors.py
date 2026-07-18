@@ -12,7 +12,13 @@ def get_local_cited_authors(df, num_of_cited_authors, fast_search=False):
         
     Returns:
         A Plotly figure object and a DataFrame of the most local cited authors.
-    """    
+
+        None (non una tupla) se la sorgente del DataFrame non e' supportata
+        per l'analisi citazionale diretta (vedi nota sotto), invece di
+        sollevare TypeError — stesso singolo valore sentinella che app.py
+        verifica con `if result is None` al punto di chiamata
+        (local_cited_authors_result.set(result) senza spacchettare prima).
+    """
     # Determine the local citation threshold
     if fast_search:
         loccit = df['TC'].quantile(0.75)
@@ -21,12 +27,25 @@ def get_local_cited_authors(df, num_of_cited_authors, fast_search=False):
 
     df = metaTagExtraction(df, "SR")
     M = df.get()
-    
+
     # Fill missing values
     M['TC'] = M['TC'].fillna(0)
 
     # Create a histogram network
     H = histNetwork(df, min_citations=loccit, sep=";", network=False)
+
+    # LIMITE NOTO (debugging step, spiegazione completa in
+    # get_historiograph.py): histNetwork ritorna None per qualunque DB diverso
+    # da "Web_of_Science"/"Scopus" (incluso il nostro "OPENALEX"), PRIMA di
+    # toccare CR — non e' un problema di formato dei riferimenti. Non estendiamo
+    # histNetwork qui (richiederebbe M['SR_FULL'], che scartiamo deliberatamente,
+    # e produrrebbe comunque reti quasi sempre vuote su campioni tipici).
+    # Propaghiamo (None, None) invece di un TypeError: stesso sentinel None gia'
+    # gestito da ogni consumer in app.py (local_cited_authors_result =
+    # reactive.value(None), con `if result is None` -> placeholder).
+    if H is None:
+        return None
+
     LCS = H['histData']
     M = H['M']
     

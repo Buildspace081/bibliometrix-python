@@ -25,10 +25,44 @@ def get_historiograph(df, node_label="AU1", histNodes=20, hist_isolates=True, hi
         hist_plot: oggetto con layout e grafo networkx
         hist_data: dataframe con metadati, DOI cliccabili, cluster, anni
         filename: nome del file HTML interattivo salvato temporaneamente
+
+        None se la sorgente del DataFrame non e' supportata per l'analisi
+        citazionale diretta (vedi nota sotto), invece di sollevare TypeError.
     """
     # Pre-elaborazione
     df = metaTagExtraction(df, "SR")
     hist_results = histNetwork(df, min_citations=0, sep=sep, network=True)
+
+    # LIMITE NOTO (debugging step, vedi anche get_local_cited_authors.py e
+    # get_local_cited_documents.py per lo stesso pattern): www/services/histnetwork.py::histNetwork
+    # supporta solo DB == "Web_of_Science" o "Scopus" (righe 37-43 di quel file);
+    # per qualunque altro valore di DB — incluso il nostro "OPENALEX", ma anche
+    # Dimensions/The_Lens/PubMed/Cochrane della pipeline storica stessa — stampa
+    # "Database not compatible with direct citation analysis" e ritorna None
+    # PRIMA di toccare la colonna CR. Non e' quindi un problema di formato di CR:
+    # la funzione non arriva mai a parsarlo per queste sorgenti.
+    #
+    # Deliberatamente NON abbiamo esteso histNetwork con un ramo "OPENALEX":
+    # 1) il ramo wos() dipende da M['SR_FULL'], colonna che la nostra pipeline
+    #    scarta deliberatamente perche' non fa parte dello schema canonico a 34
+    #    colonne (vedi openalex_mapper.py::_compute_calculated_fields) — andrebbe
+    #    comunque in KeyError;
+    # 2) anche risolvendo (1), wos() cerca auto-citazioni ESATTE all'interno
+    #    della stessa collezione (un paper che cita un altro paper anch'esso nei
+    #    risultati): su un campione generico di poche decine di risultati da una
+    #    query testuale, la rete risultante sarebbe quasi sempre vuota — non un
+    #    bug, ma un risultato di scarso valore che non giustifica lo sforzo;
+    # 3) il ramo scopus() si aspetta l'anno tra parentesi nel riferimento
+    #    (regex r'.*\((\d{4})\).*'), formato diverso dal nostro CR
+    #    "Autore, ANNO, Rivista" (anno non tra parentesi) — anche qui non un
+    #    crash, ma zero citazioni valide trovate silenziosamente.
+    # Qui ci limitiamo quindi a intercettare il None e propagarlo pulito, con lo
+    # stesso significato di "nessun risultato" gia' usato ovunque in app.py per
+    # questo tipo di analisi (historiograph_results = reactive.Value(None), con
+    # ogni consumer che fa `if result is not None` e mostra un placeholder
+    # altrimenti) — nessuna nuova convenzione introdotta.
+    if hist_results is None:
+        return None
 
     # 1. Costruzione iniziale del grafo
     hist_plot = histPlot(

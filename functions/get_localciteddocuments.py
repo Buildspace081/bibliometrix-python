@@ -12,6 +12,12 @@ def get_local_cited_documents(df, num_of_local_cited_docs, field_separator, fast
         
     Returns:
         A Plotly figure object and a DataFrame of the most local cited documents.
+
+        None (non una tupla) se la sorgente del DataFrame non e' supportata
+        per l'analisi citazionale diretta (vedi nota sotto), invece di
+        sollevare TypeError — stesso singolo valore sentinella che app.py
+        verifica con `if result is None` al punto di chiamata
+        (local_cited_documents_results.set(result) senza spacchettare prima).
     """
     df = metaTagExtraction(df, "SR")
     M = df.get()
@@ -21,12 +27,22 @@ def get_local_cited_documents(df, num_of_local_cited_docs, field_separator, fast
         loccit = M['TC'].quantile(0.75)
     else:
         loccit = 1
-    
+
     # Fill missing values
     M['TC'] = M['TC'].fillna(0)
 
     # Create a histogram network
     H = histNetwork(df, min_citations=loccit, sep=";", network=False)
+
+    # LIMITE NOTO (debugging step, spiegazione completa in
+    # get_historiograph.py): histNetwork ritorna None per qualunque DB diverso
+    # da "Web_of_Science"/"Scopus" (incluso il nostro "OPENALEX"), PRIMA di
+    # toccare CR — non e' un problema di formato dei riferimenti. Non estendiamo
+    # histNetwork qui (richiederebbe M['SR_FULL'], che scartiamo deliberatamente,
+    # e produrrebbe comunque reti quasi sempre vuote su campioni tipici).
+    if H is None:
+        return None
+
     LCS = H['histData']
     M = H['M']
     
