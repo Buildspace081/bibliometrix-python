@@ -20,6 +20,7 @@ from .get_localcitedreferences import *
 from .get_localcitedsources import *
 from .get_lotkalaw import *
 from .get_maininformations import *
+from .get_openaccessanalysis import *
 from .get_referencesspectroscopy import *
 from .get_relevantaffiliations import *
 from .get_relevantauthors import *

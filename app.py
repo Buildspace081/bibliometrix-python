@@ -1428,7 +1428,61 @@ with ui.tags.div(id="mainContent", class_="main-content"):
                             answer = "Gemini API key not configured. Please set GEMINI_API_KEY in Settings section."
 
                         await chat.append_message(answer)
-        
+
+        # --- Open Access Analysis Section ---
+        with ui.nav_panel("None", value="open_access_analysis"):
+            with ui.layout_columns(
+                col_widths=(9, 3),
+                style="margin-bottom: -21px;"
+            ):
+                with ui.tags.div(style="flex: 1; bottom: 0px;"):
+                    ui.h3("🔓 Open Access Analysis", style="color: #5567BB;")
+                    ui.p("The Open Access status distribution of the dataset")
+
+                with ui.tags.div(style="flex: 2; display: flex; justify-content: flex-end; gap: 5px; align-items: flex-start; bottom: 0px;"):
+                    ui.input_action_button("open_access_report", "Add in Report", icon=ICONS["plus"])
+
+                    todaydate = datetime.today()
+                    todaydate = todaydate.strftime("%Y-%m-%d")
+                    @render.download(
+                        label='💾 Download',
+                        filename=f"OpenAccessAnalysis-{todaydate}.png"
+                    )
+                    def download_open_access():
+                        plot_open_access, _ = open_access_informations()
+                        yield plotly_download(
+                            plot_open_access,
+                            title="Open Access Analysis",
+                            height=height.get(),
+                            dpi=dpi.get()
+                        )
+
+                @render.ui
+                @reactive.event(input.open_access_report)
+                def show_open_access_report():
+                    plots, oa_counts = open_access_informations()
+                    report_excel.set(add_to_report(report_choices, report_excel, [oa_counts], [plots], "openaccessanalysis"))
+                    selection.set(selection.get() + (f"{list(report_choices.get().keys())[-1]}",))
+                    return ui.notification_show("✅ Open Access Analysis added to report", duration=5, close_button=False)
+
+            with ui.card(full_screen=True):
+                @reactive.calc
+                def open_access_informations():
+                    return get_open_access_analysis(df)
+
+                with ui.navset_underline(id="open_access_tab"):
+                    with ui.nav_panel("Plot"):
+                        @render_widget
+                        def show_open_access_analysis():
+                            plot_open_access, oa_counts = open_access_informations()
+                            return plot_open_access
+
+                    with ui.nav_panel("Table"):
+                        @render.ui
+                        def table_open_access_analysis():
+                            _, oa_counts = open_access_informations()
+                            return ui.HTML(DT(oa_counts, style="width=100%;"))
+
         # --- Average Citations per Year Section ---
         with ui.nav_panel("None", value="average_citations_per_year"):
             with ui.layout_columns(
@@ -8305,6 +8359,7 @@ def toggle_sidebar():
             with ui.accordion_panel("Overview", icon=ICONS["play_colored"]):
                 ui.input_action_button("go_main", "Main Information", class_="sidebar-button", icon=ICONS["overview"])
                 ui.input_action_button("go_annual_scientific_production", "Annual Scientific Production", class_="sidebar-button", icon=ICONS["annual_growth_rate"])
+                ui.input_action_button("go_open_access_analysis", "Open Access Analysis", class_="sidebar-button", icon=ICONS["sources"])
                 ui.input_action_button("go_average_citations_per_year", "Average Citations per Year", class_="sidebar-button", icon=ICONS["average_citations_per_doc"])
                 ui.input_action_button("go_three_field_plot", "Three-Field Plot", class_="sidebar-button", icon=ICONS["overview"])
             with ui.accordion_panel("Sources", icon=ICONS["sources_colored"]):
@@ -8520,6 +8575,11 @@ def _():
 @reactive.event(input.go_annual_scientific_production)
 def _():
     ui.update_navs("hidden_tabs", selected="annual_scientific_production")
+
+@reactive.effect
+@reactive.event(input.go_open_access_analysis)
+def _():
+    ui.update_navs("hidden_tabs", selected="open_access_analysis")
 
 @reactive.effect
 @reactive.event(input.go_average_citations_per_year)
