@@ -525,6 +525,27 @@ def localCitations(df, fast_search=False, sep=";"):
         loccit = 1
     
     H = histNetwork(df, min_citations=loccit, sep=sep, network=False)
+
+    # LIMITE NOTO (stesso pattern gia' applicato in get_historiograph.py,
+    # get_localcitedauthors.py, get_localciteddocuments.py): histNetwork ritorna
+    # None per qualunque DB diverso da "Web_of_Science"/"Scopus" (quindi anche
+    # per "OPENALEX"), PRIMA di calcolare alcunche' - non e' un problema di
+    # formato di CR, e per le stesse ragioni gia' documentate in
+    # get_historiograph.py non estendiamo histNetwork qui. A differenza di quei
+    # tre file pero', qui il chiamante (normalizeCitationScore, quindi
+    # couplingMap/get_clustering_coupling.py) si aspetta sempre un dict con una
+    # colonna 'LCS' popolata in 'M': costruiamo un fallback con LCS=0 per ogni
+    # documento (nessun dato di citazione locale disponibile per questa
+    # sorgente) invece di propagare un TypeError su H['histData'].
+    if H is None:
+        M_fallback = M.copy()
+        M_fallback['LCS'] = 0
+        return {
+            'Authors': pd.DataFrame(columns=["Authors", "N. of Local Citations"]),
+            'Papers': pd.DataFrame(columns=["Paper", "DOI", "Year", "LCS", "GCS"]),
+            'M': M_fallback,
+        }
+
     LCS = H['histData']
     M = H['M']
     

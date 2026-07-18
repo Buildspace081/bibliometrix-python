@@ -1,11 +1,24 @@
 from www.services import *
 
 
-def get_clustering_coupling(df, unit_of_analysis, coupling_measured, stemmer, impact_measure, 
-                            cluster_labeling, ngram, num_of_units, min_cluster_freq, 
-                            label_per_cluster, label_size, community_repulsion, 
+def get_clustering_coupling(df, unit_of_analysis, coupling_measured, stemmer, impact_measure,
+                            cluster_labeling, ngram, num_of_units, min_cluster_freq,
+                            label_per_cluster, label_size, community_repulsion,
                             clustering_algorithm, node_shape='dot'):
-    
+    # LIMITE NOTO (non investigato oltre in questa sessione, fuori scope):
+    # "Cluster by Coupling" risulta lento con dati OpenAlex per una causa non
+    # identificata nella costruzione della matrice di coupling/coincidenza
+    # citazionale (couplingMap -> network -> biblionetwork/cocMatrix/
+    # network_plot in www/services/couplingmap.py), indipendente dal nostro
+    # standardizzatore. La dimensione del calcolo principale (matrice N x N
+    # documenti, N ~ 30) e' teoricamente troppo piccola per giustificare una
+    # lentezza reale, quindi non sembra un limite "normale ma lento" per
+    # questo volume di dati - ma la causa esatta non e' stata isolata (analisi
+    # non validata, si sospetta codice preesistente del professore, non
+    # necessariamente legato al formato di CR). Separato dal bug gia' corretto
+    # in couplingmap.py::localCitations (histNetwork che ritornava None senza
+    # gestione), che riguarda un crash successivo, non questa lentezza.
+
     # Generate coupling map
     coupling_map = couplingMap(
         df,
