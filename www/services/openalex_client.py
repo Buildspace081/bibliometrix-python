@@ -18,6 +18,7 @@ responsabilita' di etl_pipeline.py.
 import logging
 
 from .utils import *
+from .http_client import ExternalAPIRequestError, request_with_retry
 
 
 logger = logging.getLogger(__name__)
@@ -97,9 +98,17 @@ DEFAULT_FETCH_TIMEOUT_SECONDS = 30
 MAX_RETRY_AFTER_WAIT_SECONDS = 20
 
 
-class OpenAlexRequestError(Exception):
+class OpenAlexRequestError(ExternalAPIRequestError):
     """Sollevata quando una richiesta a OpenAlex fallisce in modo non recuperabile
-    (status 4xx diverso da 429, oppure 5xx/timeout dopo l'esaurimento dei retry)."""
+    (status 4xx diverso da 429, oppure 5xx/timeout dopo l'esaurimento dei retry).
+
+    Eredita da ExternalAPIRequestError (http_client.py) invece che direttamente
+    da Exception da quando e' stata aggiunta PubMed come seconda fonte: i due
+    punti che intercettano questa eccezione (app.py:937, etl_pipeline.py:173)
+    continuano a funzionare identici perche' e' ancora questo il tipo
+    concreto sollevato da _request_with_retry qui sotto - il cambio di base
+    class amplia solo cosa un chiamante PUO' intercettare, non cosa viene
+    sollevato."""
     pass
 
 
@@ -373,31 +382,19 @@ def _normalize_openalex_id(openalex_id_or_url):
 
 def _request_with_retry(url, params, max_retries=DEFAULT_MAX_RETRIES, backoff_factor=DEFAULT_BACKOFF_FACTOR, timeout=DEFAULT_TIMEOUT):
     """
-    Funzione interna: esegue una GET HTTP con retry ed exponential backoff.
+    Funzione interna: wrapper sottile su http_client.request_with_retry, che
+    contiene la logica di retry/backoff/timeout vera e propria (estratta da
+    qui quando e' stata aggiunta PubMed come seconda fonte, per non duplicare
+    identica la stessa logica in un ipotetico pubmed_client.py). Preserva
+    100% la firma e il comportamento esterno di questa funzione, incluso il
+    tipo di eccezione sollevato (OpenAlexRequestError): i due soli punti del
+    resto del codice che dipendono da questo tipo concreto
+    (app.py:937 `except (ETLPipelineError, OpenAlexRequestError)`,
+    etl_pipeline.py:173 `except OpenAlexRequestError`) continuano a
+    funzionare senza modifiche.
 
-    Riprova la richiesta in caso di:
-    - errori di rete/timeout,
-    - HTTP 429 (rate limit), rispettando l'header Retry-After se presente ma
-      con un tetto a MAX_RETRY_AFTER_WAIT_SECONDS (un server puo' chiedere
-      un'attesa di ore, vedi il commento su quella costante; altrimenti
-      backoff esponenziale),
-    - HTTP 5xx (errori transitori lato server).
-
-    Non riprova su errori 4xx diversi da 429 (es. 400/404), che vengono considerati
-    definitivi e propagati immediatamente come OpenAlexRequestError.
-
-    Args:
-        url: URL completo della richiesta.
-        params: dict di query string da passare a requests.get.
-        max_retries: numero massimo di RI-tentativi dopo il primo (quindi al
-            massimo max_retries + 1 richieste HTTP totali).
-        backoff_factor: fattore moltiplicativo per il tempo di attesa tra un
-            tentativo e il successivo (attesa = backoff_factor ** tentativo).
-        timeout: tupla (connect_timeout, read_timeout) in secondi, passata
-            direttamente a requests.get. NON e' un tetto sul tempo totale
-            della richiesta: read_timeout e' il silenzio massimo tollerato
-            tra un chunk di risposta e il successivo (vedi DEFAULT_TIMEOUT
-            per il perche' di questa distinzione).
+    Args: vedi http_client.request_with_retry (stessi parametri, stesso
+        significato).
 
     Returns:
         requests.Response: la risposta HTTP con status < 400.
@@ -407,51 +404,10 @@ def _request_with_retry(url, params, max_retries=DEFAULT_MAX_RETRIES, backoff_fa
             dopo l'esaurimento dei retry per 429/5xx/errori di rete, con status
             code e corpo della risposta inclusi nel messaggio per facilitare il debug.
     """
-    last_error = None
-
-    for attempt in range(max_retries + 1):
-        try:
-            response = requests.get(url, params=params, timeout=timeout)
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-            last_error = exc
-            if attempt == max_retries:
-                raise OpenAlexRequestError(
-                    f"Richiesta a {url} fallita dopo {max_retries + 1} tentativi: {exc}"
-                ) from exc
-            time.sleep(backoff_factor ** attempt)
-            continue
-
-        if response.status_code < 400:
-            return response
-
-        if response.status_code == 429 or response.status_code >= 500:
-            last_error = OpenAlexRequestError(
-                f"HTTP {response.status_code} da {url}: {response.text[:500]}"
-            )
-            if attempt == max_retries:
-                raise last_error
-
-            retry_after = response.headers.get("Retry-After")
-            wait_seconds = backoff_factor ** attempt
-            if retry_after is not None:
-                try:
-                    # Tetto a MAX_RETRY_AFTER_WAIT_SECONDS: un server puo'
-                    # legittimamente chiedere di attendere ore (visto in
-                    # produzione con un 429 da budget esaurito e
-                    # Retry-After: 28979), ma un'attesa cosi' lunga non e'
-                    # utilizzabile in un contesto interattivo - vedi il
-                    # commento su MAX_RETRY_AFTER_WAIT_SECONDS per il dettaglio.
-                    wait_seconds = min(float(retry_after), MAX_RETRY_AFTER_WAIT_SECONDS)
-                except ValueError:
-                    pass
-            time.sleep(wait_seconds)
-            continue
-
-        # 4xx diverso da 429: errore considerato definitivo, nessun retry.
-        raise OpenAlexRequestError(
-            f"HTTP {response.status_code} da {url}: {response.text[:500]}"
-        )
-
-    # Non raggiungibile in condizioni normali (il loop ritorna o solleva ad ogni
-    # iterazione), presente solo per robustezza.
-    raise OpenAlexRequestError(f"Richiesta a {url} fallita: {last_error}")
+    return request_with_retry(
+        url, params,
+        max_retries=max_retries,
+        backoff_factor=backoff_factor,
+        timeout=timeout,
+        error_cls=OpenAlexRequestError,
+    )

@@ -1,7 +1,10 @@
 """
-Entry-point unico per la pipeline ETL "query utente -> OpenAlex -> schema WoS-style".
+Entry-point ETL "query utente -> sorgente esterna -> schema WoS-style".
+Due sorgenti supportate ad oggi: OpenAlex (run_openalex_etl) e PubMed
+(run_pubmed_etl), piu' un dispatcher generico (run_etl) che sceglie tra le
+due in base a un parametro `source`.
 
-Orchestra, in ordine:
+Orchestra, in ordine, per OpenAlex:
 1. query utente -> openalex_client (ricerca + paginazione cursor-based, con
    risoluzione opzionale in batch degli ID in `referenced_works`)
 2. openalex_client -> openalex_mapper (mapping di ciascun "work" grezzo sulle
@@ -14,17 +17,56 @@ Orchestra, in ordine:
    prodotto dalla pipeline storica basata su file (vedi
    www/services/format_functions.py::process_single_file).
 
+Per PubMed lo schema e' lo stesso (stadi 3-5 identici, tramite pubmed_mapper
+invece di openalex_mapper), ma lo stadio 1-2 e' un solo passaggio
+(pubmed_client.search_articles incapsula gia' ESearch+EFetch) e non esiste
+uno stadio di risoluzione referenze separato: vedi run_pubmed_etl per il
+dettaglio del perche'.
+
 Questo modulo e' pensato come punto di ingresso alternativo a
 functions/get_data.py (che copre l'import da file WoS/Scopus/ecc.), cosi' che il
 resto della codebase (le funzioni in functions/get_*.py, che operano sul
 DataFrame condiviso `df`) possa continuare a funzionare senza sapere se i dati
-provengono da un file caricato dall'utente o da una query OpenAlex.
+provengono da un file caricato dall'utente o da una query esterna.
 """
 
 from .utils import *
 from .openalex_client import *
 from .openalex_mapper import *
+from .pubmed_client import *
+from .pubmed_mapper import *
 from .type_contracts import *
+
+# DEBUGGING LOG: openalex_mapper e pubmed_mapper definiscono ENTRAMBI una
+# funzione compute_sr_for_records (e build_sr_bridge_frame) con la STESSA
+# firma e la STESSA logica interna, per design (vedi i rispettivi moduli:
+# entrambe delegano a metatagextraction.py::SR senza modifiche). Con i due
+# `from .X import *` qui sopra, il nome bare `compute_sr_for_records` nello
+# spazio dei nomi di questo modulo finisce per riferirsi SOLO all'ultimo
+# importato (pubmed_mapper, che compare dopo openalex_mapper) - non produce
+# un bug osservabile oggi perche' le due implementazioni sono
+# byte-per-byte equivalenti, ma e' una collisione di nomi silenziosa che
+# diventerebbe un bug reale nel momento in cui una delle due venisse
+# modificata senza toccare l'altra. Per non fare affidamento su questa
+# coincidenza, gli stage source-specific qui sotto (_compute_calculated_fields
+# per OpenAlex, _compute_calculated_fields_pubmed per PubMed) chiamano la
+# funzione del modulo giusto in modo esplicito, tramite questi riferimenti
+# qualificati, invece del nome bare importato con `*`.
+from . import openalex_mapper as _openalex_mapper
+from . import pubmed_mapper as _pubmed_mapper
+
+# Stessa collisione, stessa motivazione, per DEFAULT_FETCH_TIMEOUT_SECONDS
+# (e DEFAULT_MAX_RETRIES/DEFAULT_BACKOFF_FACTOR/DEFAULT_TIMEOUT, non usati
+# qui per nome bare): openalex_client.py e pubmed_client.py definiscono
+# ENTRAMBI queste costanti con lo stesso nome e, ad oggi, lo stesso valore.
+# Riferimenti qualificati per gli stessi motivi di sopra.
+from . import openalex_client as _openalex_client
+from . import pubmed_client as _pubmed_client
+
+# Alias pubblico usato come default di run_pubmed_etl - non e' una nuova
+# costante indipendente, e' il valore di pubmed_client.DEFAULT_FETCH_TIMEOUT_SECONDS
+# esposto qui con un nome che non collide con quello (identico) di OpenAlex.
+PUBMED_DEFAULT_FETCH_TIMEOUT_SECONDS = _pubmed_client.DEFAULT_FETCH_TIMEOUT_SECONDS
 
 
 # Budget di default (secondi) per l'intera fase di risoluzione batch dei
@@ -49,7 +91,7 @@ def run_openalex_etl(
     resolve_references=True,
     strict_validation=True,
     resolve_timeout_seconds=DEFAULT_RESOLVE_TIMEOUT_SECONDS,
-    fetch_timeout_seconds=DEFAULT_FETCH_TIMEOUT_SECONDS,
+    fetch_timeout_seconds=_openalex_client.DEFAULT_FETCH_TIMEOUT_SECONDS,
 ):
     """
     Entry-point principale: esegue l'intera pipeline ETL da una query utente
@@ -131,7 +173,117 @@ def run_openalex_etl(
     return df, []
 
 
-def _fetch_raw_works(query, filters, mailto, max_results, fetch_timeout_seconds=DEFAULT_FETCH_TIMEOUT_SECONDS):
+def run_pubmed_etl(
+    query,
+    email=None,
+    api_key=None,
+    max_results=None,
+    strict_validation=True,
+    fetch_timeout_seconds=PUBMED_DEFAULT_FETCH_TIMEOUT_SECONDS,
+):
+    """
+    Entry-point principale per la sorgente PubMed: esegue l'intera pipeline
+    ETL da una query utente PubMed (E-utilities) a un pandas.DataFrame nello
+    schema a 34 colonne WoS-style. Speculare a run_openalex_etl, con due
+    differenze strutturali (non solo di nomenclatura) dovute a come e' fatta
+    l'API PubMed rispetto a OpenAlex - vedi il modulo docstring e
+    pubmed_client.py/pubmed_mapper.py per l'analisi completa:
+
+    1. Nessuno stadio di risoluzione referenze: il testo dei riferimenti
+       bibliografici (quando disponibile) e' gia' incluso nel payload di
+       EFetch (PubmedData/ReferenceList/Reference/Citation), a differenza di
+       OpenAlex dove referenced_works e' solo una lista di ID che richiede
+       una chiamata batch separata (openalex_client.get_works_by_ids). Non
+       c'e' quindi un equivalente di resolve_references/
+       resolve_timeout_seconds in questa funzione.
+    2. pubmed_client.search_articles incapsula gia' internamente sia la
+       ricerca (ESearch) che il recupero dei record completi (EFetch): un
+       solo stadio di fetch, invece dei due stadi distinti fetch+resolve di
+       run_openalex_etl.
+
+    Args:
+        query: stringa di ricerca testuale libera, inoltrata a
+            pubmed_client.search_articles (supporta i tag di campo nativi di
+            PubMed, es. "diabetes[Title]").
+        email: email da usare per identificare il chiamante presso NCBI
+            (equivalente a `mailto` in run_openalex_etl).
+        api_key: chiave API NCBI opzionale, alza il rate limit consentito.
+        max_results: numero massimo di record da scaricare; None per
+            scaricare tutti i risultati della query.
+        strict_validation: vedi run_openalex_etl (stesso significato, stessa
+            rete di sicurezza interna in _validate_records, condivisa tra le
+            due sorgenti).
+        fetch_timeout_seconds: budget di tempo (secondi) per l'INTERA
+            raccolta (ESearch + tutte le chiamate EFetch), passato a
+            pubmed_client.search_articles. Default
+            PUBMED_DEFAULT_FETCH_TIMEOUT_SECONDS (30s, stesso valore e stessa
+            motivazione di DEFAULT_FETCH_TIMEOUT_SECONDS per OpenAlex). None
+            per nessun limite.
+
+    Returns:
+        Tupla (df, validation_errors): vedi run_openalex_etl (stesso
+        contratto, stesso schema a 34 colonne, stesso ordine di colonne).
+
+    Raises:
+        ETLPipelineError: se uno stadio non recuperabile della pipeline
+            fallisce (nessun risultato dalla query, errore HTTP non gestito
+            dal client, oppure errori di validazione residui dopo la
+            coercizione dei tipi).
+    """
+    articles = _fetch_raw_pubmed_articles(query, email, api_key, max_results, fetch_timeout_seconds=fetch_timeout_seconds)
+
+    records = _map_articles_to_records(articles)
+    records = _compute_calculated_fields_pubmed(records)
+
+    coerced_records, _ = _validate_records(records, strict=strict_validation)
+
+    df = _build_dataframe(coerced_records)
+
+    return df, []
+
+
+def run_etl(source="openalex", **kwargs):
+    """
+    Dispatcher generico: inoltra l'esecuzione a run_openalex_etl o
+    run_pubmed_etl in base a `source`, cosi' che un chiamante (tipicamente
+    una UI con un selettore di sorgente) possa dipendere da un'unica
+    funzione invece di scegliere quale delle due chiamare.
+
+    NON sostituisce run_openalex_etl come punto di ingresso: app.py chiama
+    gia' direttamente run_openalex_etl (vedi il call site nella pagina "API"
+    del dashboard) e continua a funzionare invariato — questo dispatcher e'
+    stato aggiunto in aggiunta, non al posto di, per soddisfare l'esplicita
+    richiesta di un parametro `source` (default "openalex") senza toccare un
+    percorso gia' testato dal vivo. Un'eventuale futura UI PubMed potra'
+    scegliere se chiamare run_pubmed_etl direttamente (stesso pattern di
+    run_openalex_etl in app.py oggi) o passare da qui.
+
+    Args:
+        source: "openalex" (default) o "pubmed". Qualunque altro valore
+            solleva ValueError immediatamente, prima di qualunque chiamata
+            di rete.
+        **kwargs: inoltrati cosi' come sono alla funzione scelta (vedi
+            run_openalex_etl/run_pubmed_etl per i parametri accettati da
+            ciascuna sorgente — NON sono intercambiabili: es.
+            resolve_references e resolve_timeout_seconds esistono solo per
+            "openalex", email/api_key solo per "pubmed").
+
+    Returns:
+        Tupla (df, validation_errors), vedi run_openalex_etl/run_pubmed_etl.
+
+    Raises:
+        ValueError: se `source` non e' "openalex" ne' "pubmed".
+        ETLPipelineError, OpenAlexRequestError, PubMedRequestError: propagate
+            cosi' come sollevate dalla funzione scelta.
+    """
+    if source == "openalex":
+        return run_openalex_etl(**kwargs)
+    if source == "pubmed":
+        return run_pubmed_etl(**kwargs)
+    raise ValueError(f"source non riconosciuta: {source!r} (attese: 'openalex', 'pubmed').")
+
+
+def _fetch_raw_works(query, filters, mailto, max_results, fetch_timeout_seconds=_openalex_client.DEFAULT_FETCH_TIMEOUT_SECONDS):
     """
     Stadio 1: recupera dalla API OpenAlex la lista grezza di oggetti "work" (dict
     JSON) corrispondenti alla query utente, delegando a
@@ -291,7 +443,91 @@ def _compute_calculated_fields(records):
         decisione presa esplicitamente dopo averlo verificato con
         type_contracts.validate_record durante lo sviluppo di questo modulo.
     """
-    enriched = compute_sr_for_records(records)
+    enriched = _openalex_mapper.compute_sr_for_records(records)
+    for record in enriched:
+        record.pop("SR_FULL", None)
+    return enriched
+
+
+def _fetch_raw_pubmed_articles(query, email, api_key, max_results, fetch_timeout_seconds=PUBMED_DEFAULT_FETCH_TIMEOUT_SECONDS):
+    """
+    Stadio 1 (PubMed): recupera dalle E-utilities la lista grezza di elementi
+    <PubmedArticle> corrispondenti alla query utente, delegando a
+    pubmed_client.search_articles (che gia' incapsula sia ESearch che EFetch
+    a batch - vedi run_pubmed_etl per il contrasto con i due stadi separati
+    usati da OpenAlex).
+
+    Args:
+        query, email, api_key, max_results: vedi run_pubmed_etl.
+        fetch_timeout_seconds: budget di tempo (secondi) per l'INTERA
+            raccolta (ESearch + tutte le EFetch). Default
+            PUBMED_DEFAULT_FETCH_TIMEOUT_SECONDS (30s). None per nessun limite.
+
+    Returns:
+        list[xml.etree.ElementTree.Element]: nodi <PubmedArticle> grezzi
+        (eventualmente parziali se il budget di tempo e' stato superato).
+
+    Raises:
+        ETLPipelineError: se la query non produce alcun risultato, oppure se
+            pubmed_client.search_articles solleva PubMedRequestError (errore
+            HTTP non recuperabile dopo i retry).
+    """
+    try:
+        articles = search_articles(
+            query,
+            max_results=max_results,
+            email=email,
+            api_key=api_key,
+            fetch_timeout_seconds=fetch_timeout_seconds,
+        )
+    except PubMedRequestError as exc:
+        raise ETLPipelineError(
+            f"Recupero degli articoli da PubMed fallito per la query {query!r}: {exc}"
+        ) from exc
+
+    if not articles:
+        raise ETLPipelineError(f"Nessun risultato PubMed per la query {query!r}.")
+
+    return articles
+
+
+def _map_articles_to_records(articles):
+    """
+    Stadio 2 (PubMed): applica pubmed_mapper.map_article_to_record a
+    ciascun elemento <PubmedArticle> grezzo, producendo la lista di record
+    (dict) nello schema a 34 colonne WoS-style (esclusi i campi calcolati a
+    livello di collezione come SR). Analoga a _map_works_to_records, ma senza
+    un parametro equivalente a resolved_references: PubMed non richiede
+    alcuna risoluzione separata per CR (vedi run_pubmed_etl).
+
+    Args:
+        articles: list[xml.etree.ElementTree.Element] di <PubmedArticle>
+            grezzi.
+
+    Returns:
+        list[dict]: un record per articolo, con le chiavi delle 34 colonne
+        (tranne i campi calcolati a livello di collezione).
+    """
+    return [map_article_to_record(article) for article in articles]
+
+
+def _compute_calculated_fields_pubmed(records):
+    """
+    Stadio 3 (PubMed): calcola i campi derivati dall'intera collezione (SR),
+    identico a _compute_calculated_fields ma tramite
+    pubmed_mapper.compute_sr_for_records invece della versione OpenAlex -
+    vedi il commento in cima al modulo sul perche' questi due riferimenti
+    vanno tenuti espliciti invece di usare il nome bare
+    `compute_sr_for_records`.
+
+    Args:
+        records: list[dict] prodotta da _map_articles_to_records.
+
+    Returns:
+        list[dict]: nuovi record arricchiti con la chiave "SR" (SR_FULL
+        scartata, stessa motivazione di _compute_calculated_fields).
+    """
+    enriched = _pubmed_mapper.compute_sr_for_records(records)
     for record in enriched:
         record.pop("SR_FULL", None)
     return enriched

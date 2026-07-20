@@ -6,12 +6,15 @@ from .format_functions import *
 from .histnetwork import *
 from .histplot import *
 from .htmldownload import *
+from .http_client import *
 from .igraph2vis import *
 from .metatagextraction import *
 from .networkplot import *
 from .openalex_client import *
 from .openalex_mapper import *
 from .parsers import *
+from .pubmed_client import *
+from .pubmed_mapper import *
 from .plotlydownload import *
 from .savereport import *
 from .tabletag import *
