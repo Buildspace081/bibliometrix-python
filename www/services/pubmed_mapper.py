@@ -782,13 +782,18 @@ def format_la_column(article):
 
 def format_oa_column(article):
     """
-    Colonna OA (Open Access). Campo non disponibile da PubMed per questa
-    pipeline: restituisce sempre stringa vuota per decisione esplicita.
-    L'EFetch di PubMed non espone alcun flag di stato Open Access; un dato
-    equivalente esisterebbe solo incrociando fonti esterne (es. Unpaywall, o
-    la presenza di un ArticleId con IdType="pmc" come proxy indiretto di
-    "testo integrale disponibile su PMC", che pero' non è sinonimo di Open
-    Access in senso stretto) - fuori scope per questa pipeline.
+    Colonna OA (Open Access). Restituisce sempre stringa vuota: stesso
+    trattamento di TC (vedi format_tc_column), per lo stesso motivo
+    concettuale — PubMed non e' una fonte di dati OA.
+
+    L'EFetch non espone alcun flag di stato Open Access equivalente al
+    vocabolario controllato di OpenAlex (oa_status: "gold"/"green"/"hybrid"/
+    "bronze"/"closed", derivato da Unpaywall). L'unico segnale presente
+    nell'XML e' ArticleId[@IdType="pmc"] (presenza del full-text su PubMed
+    Central), che e' un proxy approssimativo — "PMC disponibile" non coincide
+    con "Open Access" in senso Unpaywall/DOAJ: ci sono articoli OA non in PMC
+    e articoli in PMC non genuinamente OA. Questa approssimazione e' stata
+    valutata e rifiutata: preferibile "" coerente a un dato fuorviante.
 
     Args:
         article: elemento <PubmedArticle> (non usato).

@@ -854,24 +854,35 @@ with ui.tags.div(id="mainContent", class_="main-content"):
                 ),
 
         with ui.nav_panel("None", value="API"):
-            ui.h3("🔌 OpenAlex API", style="color: #5567BB;")
-            ui.p("Search OpenAlex directly and import the results as a bibliometrix-style dataset.")
+            ui.h3("🔌 Live API Query", style="color: #5567BB;")
+            ui.p("Search OpenAlex or PubMed directly and import the results as a bibliometrix-style dataset.")
 
             with ui.layout_sidebar(fillable=False, fill=False):
                 with ui.sidebar(id="sidebar_api", position="right"):
-                    ui.h5("OpenAlex Query", style="color: #5567BB;")
+                    ui.h5("Query Parameters", style="color: #5567BB;")
+                    ui.input_select("api_source", "Source", choices={"openalex": "OpenAlex", "pubmed": "PubMed"}, selected="openalex")
                     ui.input_text("api_query", "Search query", placeholder="es. machine learning")
+
+                    @render.ui
+                    def api_email_ui():
+                        if input.api_source() == "pubmed":
+                            return ui.input_text("api_email", "Email (NCBI)", placeholder="optional, e.g. user@example.com")
+                        return ui.div()
+
                     ui.input_numeric("api_max_results", "Max results", value=50, min=1, max=200)
                     ui.input_action_button("start_api_button", "Start", icon=ICONS["play"])
 
                 @reactive.effect
                 @reactive.event(input.start_api_button)
                 def run_api_query():
+                    source = input.api_source()
+                    source_name = "PubMed" if source == "pubmed" else "OpenAlex"
+
                     # Show loading modal while querying (same style as Historiograph)
                     def loading_modal():
                         phrases = [
                             "⏳ Loading... Please wait.",
-                            "🔎 Querying OpenAlex...",
+                            f"🔎 Querying {source_name}...",
                             "📥 Downloading records...",
                             "🧬 Standardizing metadata...",
                             "📊 Preparing your dataset...",
@@ -919,23 +930,31 @@ with ui.tags.div(id="mainContent", class_="main-content"):
                             ui.notification_show("⚠️ Please enter a search query.", type="warning", duration=5)
                             return
 
-                        # info@bibliometrix.org: indirizzo di progetto gia' usato
-                        # altrove in app.py (sezione About) per la polite pool OpenAlex
-                        result_df, validation_errors = run_openalex_etl(
-                            query,
-                            mailto="info@bibliometrix.org",
-                            max_results=max_results,
-                        )
+                        if source == "pubmed":
+                            email = (input.api_email() or "").strip() or None
+                            result_df, validation_errors = run_pubmed_etl(
+                                query,
+                                email=email,
+                                max_results=max_results,
+                            )
+                        else:
+                            # info@bibliometrix.org: indirizzo di progetto gia' usato
+                            # altrove in app.py (sezione About) per la polite pool OpenAlex
+                            result_df, validation_errors = run_openalex_etl(
+                                query,
+                                mailto="info@bibliometrix.org",
+                                max_results=max_results,
+                            )
 
                         df.set(result_df)
                         reset_all_analyses()
                         ui.notification_show(
-                            f"✅ OpenAlex query completed! The dataset contains {result_df.shape[0]} rows and {result_df.shape[1]} columns.",
+                            f"✅ {source_name} query completed! The dataset contains {result_df.shape[0]} rows and {result_df.shape[1]} columns.",
                             duration=5,
                             close_button=False,
                         )
-                    except (ETLPipelineError, OpenAlexRequestError) as e:
-                        ui.notification_show(f"❌ Error querying OpenAlex: {str(e)}", type="error", duration=10)
+                    except (ETLPipelineError, OpenAlexRequestError, PubMedRequestError) as e:
+                        ui.notification_show(f"❌ Error querying {source_name}: {str(e)}", type="error", duration=10)
                     except Exception as e:
                         ui.notification_show(f"❌ Unexpected error: {str(e)}", type="error", duration=10)
                     finally:
